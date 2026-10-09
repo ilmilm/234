@@ -1,0 +1,157 @@
+name: artex-image
+
+# 只用「手动触发」：仓库页面 → Actions → 左侧 artex-image → Run workflow。
+# 刻意不挂 push / tag 触发器 —— 仓库自带的 release.yml 会在推 v* tag 时触发，
+# 并且硬编码推送到已失效的 autumn27/artex（还需要原作者才有的 DOCKERHUB 密钥），
+# 一推 tag 就会红。用手动触发可以完全绕开它。
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "目标平台（飞牛 NAS / 笔记本 x86 用 linux/amd64）"
+        required: true
+        default: "linux/amd64"
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+          - linux/amd64,linux/arm64
+      tag:
+        description: "镜像 tag"
+        required: true
+        default: "latest"
+        type: string
+
+# 推 ghcr.io 只需要 packages: write，用的是 Actions 内置的 GITHUB_TOKEN，
+# 不需要你在仓库里配置任何 Secret。
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ─────────────────────────────────────────────────────────────
+      # GHCR 的镜像路径**必须全小写**，而 GitHub 用户名允许大写
+      # （例如 JohnDoe）。Actions 表达式里没有 toLower()，所以用 bash 的
+      # ${VAR,,} 展开算出小写名。少了这步，用户名带大写的人推镜像时
+      # 会报 "invalid reference format: repository name must be lowercase"。
+      # ─────────────────────────────────────────────────────────────
+      - name: Compute lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/artex" >> "$GITHUB_OUTPUT"
+
+      # ─────────────────────────────────────────────────────────────
+      # ① 前端静态导出 → web/out
+      # ─────────────────────────────────────────────────────────────
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend (static export)
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:static
+          test -f out/index.html
+
+      # ─────────────────────────────────────────────────────────────
+      # ② 【关键】server/webui 目录在源码里根本不存在，
+      #    而 server/webui_embed.go 里写着 //go:embed all:webui/dist。
+      #    不手动建这个目录并塞进前端产物，下一步 go build -tags embedui
+      #    必定报 "pattern all:webui/dist: no matching files found"。
+      # ─────────────────────────────────────────────────────────────
+      - name: Stage embedded frontend
+        run: |
+          mkdir -p server/webui/dist
+          cp -r web/out/. server/webui/dist/
+          echo "--- server/webui/dist 顶层 ---"
+          ls -la server/webui/dist | head -20
+
+      # ─────────────────────────────────────────────────────────────
+      # ③ Go 交叉编译出 Linux 二进制（amd64 + arm64 都出）
+      #    两个架构都编，这样 Dockerfile 里的 COPY dist/${TARGETARCH}/artex
+      #    在任何 platforms 组合下都有货，彻底消除 arch 不匹配的坑。
+      #    CGO_ENABLED=0 是纯 Go 交叉编译的前提（build.sh 里也是这么做的）。
+      # ─────────────────────────────────────────────────────────────
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Linux binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+        run: |
+          go version
+          for arch in amd64 arm64; do
+            GOARCH=$arch go build -tags embedui -trimpath \
+              -ldflags "-s -w -buildid=" \
+              -o dist/$arch/artex ./cmd/artex
+            ls -lh dist/$arch/artex
+            file dist/$arch/artex
+          done
+
+      - name: Smoke test linux/amd64 binary
+        run: |
+          chmod +x dist/amd64/artex
+          dist/amd64/artex -h || true   # -h 走 flag 的 ErrHelp，正常退出
+
+      # ─────────────────────────────────────────────────────────────
+      # ④ 打镜像并推送到 ghcr.io
+      #    Dockerfile 只做三件事：装工具链(ripgrep/nmap/Node20/Playwright+Chromium)、
+      #    COPY dist/${TARGETARCH}/artex、ENTRYPOINT start.sh。
+      #    它自己不编译 —— 所以上面①②③必须先跑完。
+      # ─────────────────────────────────────────────────────────────
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ inputs.tag }}
+            ${{ steps.img.outputs.name }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo '```'
+            echo "${{ steps.img.outputs.name }}:${{ inputs.tag }}"
+            echo '```'
+            echo ""
+            echo "平台：\`${{ inputs.platforms }}\`"
+            echo ""
+            echo "**下一步（重要）**：GHCR 的包默认是 private，"
+            echo "去 https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/artex/settings"
+            echo "把可见性改成 Public，否则 NAS 拉不动（除非在 NAS 上 docker login ghcr.io）。"
+          } >> "$GITHUB_STEP_SUMMARY"
